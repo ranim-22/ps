@@ -1,10 +1,3 @@
-"""
-Surveillance Robot Control System
-Raspberry Pi 4 Model B with Camera Module Rev 1.3
-GM-25-370 motors with 6-pin encoders (M1, GND, C1, C2, 3.3V, M2)
-MPU-9250 IMU for navigation
-"""
-
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 import cv2
@@ -17,34 +10,20 @@ import json
 import threading
 import time
 import sys
-import math
-from collections import deque
+from gpiozero import PWMOutputDevice, DigitalOutputDevice
 
-# ========== GPIO PIN DEFINITIONS FOR RASPBERRY PI ==========
-# MPU-9250 uses I2C communication - FIXED PINS on Raspberry Pi
-MPU_SDA_PIN = 2    # GPIO 2, Physical Pin 3 (I2C1 SDA) - FIXED
-MPU_SCL_PIN = 3    # GPIO 3, Physical Pin 5 (I2C1 SCL) - FIXED
-# Note: These pins are hardwired for I2C on Raspberry Pi, don't change them!
-
-# Camera module imports
 try:
     from picamera2 import Picamera2
     PICAMERA2_AVAILABLE = True
 except ImportError:
     PICAMERA2_AVAILABLE = False
-    print("⚠ picamera2 not installed. Install with: pip install picamera2")
 
-# GPIO imports for Raspberry Pi
 try:
     import RPi.GPIO as GPIO
     GPIO_AVAILABLE = True
-    # Use BCM numbering (GPIO numbers, not physical pin numbers)
-    GPIO.setmode(GPIO.BCM)
 except ImportError:
     GPIO_AVAILABLE = False
-    print("⚠ RPi.GPIO not available - running in simulation mode")
 
-# Serial communication imports
 try:
     import serial
     SERIAL_AVAILABLE = True
@@ -52,777 +31,702 @@ except ImportError:
     serial = None
     SERIAL_AVAILABLE = False
 
-
-class MPU9250:
-    """
-    MPU-9250 9-Axis IMU Class for Raspberry Pi
-    Provides accelerometer, gyroscope, and magnetometer data
-    Connects via I2C to GPIO 2 (SDA) and GPIO 3 (SCL)
-    """
-    
+class DualMotorController:
     def __init__(self):
-        # I2C addresses
-        self.MPU_ADDRESS = 0x68  # MPU-9250 main address
-        self.MAG_ADDRESS = 0x0C  # Magnetometer address
+        self.left_motor_pwm = PWMOutputDevice(17)
+        self.left_motor_forward = DigitalOutputDevice(22)
+        self.left_motor_backward = DigitalOutputDevice(27)
         
-        # Calibration data
-        self.accel_bias = [0, 0, 0]
-        self.gyro_bias = [0, 0, 0]
-        self.mag_bias = [0, 0, 0]
-        self.mag_scale = [1, 1, 1]
+        self.right_motor_pwm = PWMOutputDevice(13)
+        self.right_motor_forward = DigitalOutputDevice(19)
+        self.right_motor_backward = DigitalOutputDevice(26)
         
-        # Raw sensor data
-        self.accel_raw = [0, 0, 0]
-        self.gyro_raw = [0, 0, 0]
-        self.mag_raw = [0, 0, 0]
-        self.temp_raw = 0
+        self.default_speed = 0.6
+        self.turn_speed = 0.4
         
-        # Scaled data
-        self.accel_scaled = [0.0, 0.0, 0.0]  # g
-        self.gyro_scaled = [0.0, 0.0, 0.0]   # °/s
-        self.mag_scaled = [0.0, 0.0, 0.0]    # µT
-        self.temperature = 0.0               # °C
+        self.left_encoder_count = 0
+        self.right_encoder_count = 0
         
-        # Orientation
-        self.roll = 0.0
-        self.pitch = 0.0
-        self.yaw = 0.0
-        self.yaw_offset = 0.0
-        
-        # I2C bus
-        self.bus = None
-        
-        # Initialize MPU-9250
-        self.init_mpu9250()
-        
-        # Calibrate sensors
-        self.calibrate()
+        self.stop_all()
     
-    def init_mpu9250(self):
-        """
-        Initialize MPU-9250 IMU over I2C
-        Raspberry Pi I2C pins: GPIO 2 (SDA), GPIO 3 (SCL)
-        """
-        try:
-            import smbus
-            # I2C bus 1 is default on Raspberry Pi (pins 3 and 5)
-            self.bus = smbus.SMBus(1)
-            
-            # ========== MPU-9250 INITIALIZATION ==========
-            # Wake up MPU-9250 (Power Management 1 register)
-            self.bus.write_byte_data(self.MPU_ADDRESS, 0x6B, 0x00)
-            time.sleep(0.1)
-            
-            # Configure accelerometer: ±2g range
-            # 0x00 = ±2g, 0x08 = ±4g, 0x10 = ±8g, 0x18 = ±16g
-            self.bus.write_byte_data(self.MPU_ADDRESS, 0x1C, 0x00)
-            
-            # Configure gyroscope: ±250°/s range
-            # 0x00 = ±250°/s, 0x08 = ±500°/s, 0x10 = ±1000°/s, 0x18 = ±2000°/s
-            self.bus.write_byte_data(self.MPU_ADDRESS, 0x1B, 0x00)
-            
-            # Configure low pass filter (DLPF)
-            self.bus.write_byte_data(self.MPU_ADDRESS, 0x1A, 0x03)
-            
-            # ========== MAGNETOMETER INITIALIZATION ==========
-            # First enable bypass mode to access magnetometer
-            self.bus.write_byte_data(self.MPU_ADDRESS, 0x37, 0x02)
-            time.sleep(0.1)
-            
-            # Power down magnetometer
-            self.bus.write_byte_data(self.MAG_ADDRESS, 0x0A, 0x00)
-            time.sleep(0.1)
-            
-            # Enter Fuse ROM access mode
-            self.bus.write_byte_data(self.MAG_ADDRESS, 0x0A, 0x0F)
-            time.sleep(0.1)
-            
-            # Read magnetometer sensitivity adjustment values
-            mag_data = self.bus.read_i2c_block_data(self.MAG_ADDRESS, 0x10, 3)
-            self.mag_scale[0] = (mag_data[0] - 128) / 256.0 + 1.0
-            self.mag_scale[1] = (mag_data[1] - 128) / 256.0 + 1.0
-            self.mag_scale[2] = (mag_data[2] - 128) / 256.0 + 1.0
-            
-            # Power down magnetometer again
-            self.bus.write_byte_data(self.MAG_ADDRESS, 0x0A, 0x00)
-            time.sleep(0.1)
-            
-            # Set magnetometer to continuous measurement mode 2 (100Hz)
-            self.bus.write_byte_data(self.MAG_ADDRESS, 0x0A, 0x16)
-            time.sleep(0.1)
-            
-            print("✅ MPU-9250 initialized successfully")
-            print(f"   I2C Address: 0x{self.MPU_ADDRESS:02X}")
-            print(f"   Magnetometer Address: 0x{self.MAG_ADDRESS:02X}")
-            print(f"   I2C Pins: GPIO 2 (SDA), GPIO 3 (SCL)")
-            
-        except Exception as e:
-            print(f"❌ MPU-9250 initialization error: {e}")
-            print("   Check: sudo raspi-config -> Interface Options -> I2C -> Enable")
-            print("   Check wiring: SDA to Pin 3, SCL to Pin 5, VCC to 3.3V, GND to GND")
-            self.bus = None
-    
-    def read_word(self, address, register):
-        """
-        Read signed 16-bit word from I2C register
-        """
-        try:
-            high = self.bus.read_byte_data(address, register)
-            low = self.bus.read_byte_data(address, register + 1)
-            value = (high << 8) + low
-            
-            # Convert to signed integer
-            if value >= 0x8000:
-                return -((65535 - value) + 1)
-            return value
-        except:
-            return 0
-    
-    def read_sensors(self):
-        """
-        Read all sensors: accelerometer, gyroscope, magnetometer, temperature
-        """
-        if not self.bus:
-            return False
+    def _set_motor(self, forward_pin, backward_pin, pwm_pin, speed, direction):
+        if direction == "forward":
+            forward_pin.on()
+            backward_pin.off()
+        elif direction == "backward":
+            forward_pin.off()
+            backward_pin.on()
+        elif direction == "stop":
+            forward_pin.off()
+            backward_pin.off()
         
-        try:
-            # Read accelerometer (registers 0x3B-0x40)
-            self.accel_raw[0] = self.read_word(self.MPU_ADDRESS, 0x3B)
-            self.accel_raw[1] = self.read_word(self.MPU_ADDRESS, 0x3D)
-            self.accel_raw[2] = self.read_word(self.MPU_ADDRESS, 0x3F)
-            
-            # Read temperature (register 0x41)
-            self.temp_raw = self.read_word(self.MPU_ADDRESS, 0x41)
-            
-            # Read gyroscope (registers 0x43-0x48)
-            self.gyro_raw[0] = self.read_word(self.MPU_ADDRESS, 0x43)
-            self.gyro_raw[1] = self.read_word(self.MPU_ADDRESS, 0x45)
-            self.gyro_raw[2] = self.read_word(self.MPU_ADDRESS, 0x47)
-            
-            # Read magnetometer (registers 0x03-0x08)
-            # Check data ready status
-            status = self.bus.read_byte_data(self.MAG_ADDRESS, 0x02)
-            if status & 0x01:
-                self.mag_raw[0] = self.read_word(self.MAG_ADDRESS, 0x04)  # X
-                self.mag_raw[1] = self.read_word(self.MAG_ADDRESS, 0x06)  # Y
-                self.mag_raw[2] = self.read_word(self.MAG_ADDRESS, 0x08)  # Z
-            else:
-                # No new magnetometer data
-                pass
-            
-            # Scale raw data to real units
-            self.scale_data()
-            
-            # Calculate orientation
-            self.calculate_orientation()
-            
-            return True
-            
-        except Exception as e:
-            print(f"MPU-9250 read error: {e}")
-            return False
-    
-    def scale_data(self):
-        """
-        Scale raw sensor data to real units
-        """
-        # Accelerometer scaling (±2g range: 16384 LSB/g)
-        accel_scale = 16384.0
-        self.accel_scaled[0] = (self.accel_raw[0] - self.accel_bias[0]) / accel_scale
-        self.accel_scaled[1] = (self.accel_raw[1] - self.accel_bias[1]) / accel_scale
-        self.accel_scaled[2] = (self.accel_raw[2] - self.accel_bias[2]) / accel_scale
-        
-        # Gyroscope scaling (±250°/s range: 131 LSB/°/s)
-        gyro_scale = 131.0
-        self.gyro_scaled[0] = (self.gyro_raw[0] - self.gyro_bias[0]) / gyro_scale
-        self.gyro_scaled[1] = (self.gyro_raw[1] - self.gyro_bias[1]) / gyro_scale
-        self.gyro_scaled[2] = (self.gyro_raw[2] - self.gyro_bias[2]) / gyro_scale
-        
-        # Temperature scaling
-        self.temperature = (self.temp_raw / 340.0) + 36.53
-        
-        # Magnetometer scaling (16-bit output)
-        mag_scale = 0.15  # µT per LSB (adjust based on datasheet)
-        self.mag_scaled[0] = (self.mag_raw[0] - self.mag_bias[0]) * self.mag_scale[0] * mag_scale
-        self.mag_scaled[1] = (self.mag_raw[1] - self.mag_bias[1]) * self.mag_scale[1] * mag_scale
-        self.mag_scaled[2] = (self.mag_raw[2] - self.mag_bias[2]) * self.mag_scale[2] * mag_scale
-    
-    def calculate_orientation(self):
-        """
-        Calculate roll, pitch, and yaw from sensor data
-        """
-        # Calculate roll and pitch from accelerometer
-        self.roll = math.atan2(self.accel_scaled[1], self.accel_scaled[2]) * 180.0 / math.pi
-        self.pitch = math.atan2(-self.accel_scaled[0], 
-                               math.sqrt(self.accel_scaled[1]**2 + self.accel_scaled[2]**2)) * 180.0 / math.pi
-        
-        # Calculate yaw from magnetometer (tilt-compensated)
-        mag_x = self.mag_scaled[0] * math.cos(self.pitch * math.pi/180.0) + \
-                self.mag_scaled[2] * math.sin(self.pitch * math.pi/180.0)
-        
-        mag_y = self.mag_scaled[0] * math.sin(self.roll * math.pi/180.0) * math.sin(self.pitch * math.pi/180.0) + \
-                self.mag_scaled[1] * math.cos(self.roll * math.pi/180.0) - \
-                self.mag_scaled[2] * math.sin(self.roll * math.pi/180.0) * math.cos(self.pitch * math.pi/180.0)
-        
-        self.yaw = math.atan2(-mag_y, mag_x) * 180.0 / math.pi - self.yaw_offset
-        
-        # Normalize yaw to 0-360 degrees
-        if self.yaw < 0:
-            self.yaw += 360
-        if self.yaw >= 360:
-            self.yaw -= 360
-    
-    def calibrate(self, samples=500):
-        """
-        Calibrate accelerometer and gyroscope
-        Robot must be stationary during calibration
-        """
-        if not self.bus:
-            print("❌ Cannot calibrate - MPU-9250 not connected")
-            return
-        
-        print("🔄 Calibrating MPU-9250... Keep robot stationary!")
-        
-        # Initialize sums
-        accel_sum = [0, 0, 0]
-        gyro_sum = [0, 0, 0]
-        
-        # Collect samples
-        for i in range(samples):
-            self.read_sensors()
-            
-            accel_sum[0] += self.accel_raw[0]
-            accel_sum[1] += self.accel_raw[1]
-            accel_sum[2] += self.accel_raw[2]
-            
-            gyro_sum[0] += self.gyro_raw[0]
-            gyro_sum[1] += self.gyro_raw[1]
-            gyro_sum[2] += self.gyro_raw[2]
-            
-            time.sleep(0.01)
-            
-            # Show progress
-            if i % 50 == 0:
-                print(f"   Calibration: {i}/{samples}")
-        
-        # Calculate averages (biases)
-        self.accel_bias[0] = accel_sum[0] / samples
-        self.accel_bias[1] = accel_sum[1] / samples
-        self.accel_bias[2] = (accel_sum[2] / samples) - 16384  # Subtract 1g for Z-axis
-        
-        self.gyro_bias[0] = gyro_sum[0] / samples
-        self.gyro_bias[1] = gyro_sum[1] / samples
-        self.gyro_bias[2] = gyro_sum[2] / samples
-        
-        print("✅ Calibration complete")
-        print(f"   Accel Bias: X={self.accel_bias[0]:.0f}, Y={self.accel_bias[1]:.0f}, Z={self.accel_bias[2]:.0f}")
-        print(f"   Gyro Bias: X={self.gyro_bias[0]:.0f}, Y={self.gyro_bias[1]:.0f}, Z={self.gyro_bias[2]:.0f}")
-    
-    def calibrate_magnetometer(self):
-        """
-        Calibrate magnetometer (requires rotating robot in figure-8 pattern)
-        """
-        if not self.bus:
-            return
-        
-        print("🔄 Calibrating magnetometer... Rotate robot in figure-8 pattern!")
-        print("   This will take about 30 seconds...")
-        
-        mag_min = [32767, 32767, 32767]
-        mag_max = [-32768, -32768, -32768]
-        start_time = time.time()
-        
-        # Collect magnetometer data while rotating
-        while time.time() - start_time < 30:
-            self.read_sensors()
-            
-            # Update min/max values
-            for i in range(3):
-                if self.mag_raw[i] < mag_min[i]:
-                    mag_min[i] = self.mag_raw[i]
-                if self.mag_raw[i] > mag_max[i]:
-                    mag_max[i] = self.mag_raw[i]
-            
-            time.sleep(0.1)
-        
-        # Calculate bias and scale
-        for i in range(3):
-            self.mag_bias[i] = (mag_max[i] + mag_min[i]) / 2
-            self.mag_scale[i] = (mag_max[i] - mag_min[i]) / 2
-        
-        print("✅ Magnetometer calibration complete")
-        print(f"   Mag Bias: X={self.mag_bias[0]:.0f}, Y={self.mag_bias[1]:.0f}, Z={self.mag_bias[2]:.0f}")
-    
-    def set_yaw_reference(self):
-        """
-        Set current yaw as reference (0 degrees)
-        """
-        self.yaw_offset = self.yaw
-        print(f"✅ Yaw reference set to {self.yaw_offset:.1f}°")
-    
-    def get_data(self):
-        """
-        Get all sensor data in a dictionary
-        """
-        return {
-            'accel': self.accel_scaled.copy(),      # [g]
-            'gyro': self.gyro_scaled.copy(),        # [°/s]
-            'mag': self.mag_scaled.copy(),          # [µT]
-            'temp': self.temperature,               # [°C]
-            'roll': self.roll,                      # [°]
-            'pitch': self.pitch,                    # [°]
-            'yaw': self.yaw,                        # [°]
-            'accel_raw': self.accel_raw.copy(),     # Raw values
-            'gyro_raw': self.gyro_raw.copy(),       # Raw values
-            'mag_raw': self.mag_raw.copy()          # Raw values
-        }
-    
-    def get_heading(self):
-        """
-        Get compass heading (0° = North, 90° = East, 180° = South, 270° = West)
-        """
-        return self.yaw
-    
-    def get_tilt_compensated_heading(self):
-        """
-        Get tilt-compensated heading
-        """
-        return self.yaw
-    
-    def is_connected(self):
-        """
-        Check if MPU-9250 is connected
-        """
-        return self.bus is not None
-
-
-class MotorController:
-    """
-    Motor Controller for GM-25-370 motors with 6-pin integrated encoders
-    Now with MPU-9250 integration for precise navigation
-    """
-    
-    def __init__(self):
-        # ========== MOTOR WIRING CONFIGURATION ==========
-        # Motor power wires (connected to L298N driver)
-        # Left Motor (Motor A)
-        self.MOTOR_A_PWM = 18      # GPIO 18, PWM for left motor speed
-        self.MOTOR_A_IN1 = 17      # GPIO 17, Left motor direction 1
-        self.MOTOR_A_IN2 = 27      # GPIO 27, Left motor direction 2
-        
-        # Right Motor (Motor B)
-        self.MOTOR_B_PWM = 24      # GPIO 24, PWM for right motor speed
-        self.MOTOR_B_IN3 = 22      # GPIO 22, Right motor direction 1
-        self.MOTOR_B_IN4 = 23      # GPIO 23, Right motor direction 2
-        
-        # ========== ENCODER WIRING CONFIGURATION ==========
-        # Left Motor Encoder (6 pins: M1, GND, C1, C2, 3.3V, M2)
-        self.ENCODER_A_CHANNEL_A = 5    # GPIO 5, C1 pin (Phase A)
-        self.ENCODER_A_CHANNEL_B = 6    # GPIO 6, C2 pin (Phase B)
-        
-        # Right Motor Encoder
-        self.ENCODER_B_CHANNEL_A = 13   # GPIO 13, C1 pin (Phase A)
-        self.ENCODER_B_CHANNEL_B = 19   # GPIO 19, C2 pin (Phase B)
-        
-        # ========== MPU-9250 INITIALIZATION ==========
-        self.mpu = MPU9250()
-        
-        # ========== MOTOR SPECIFICATIONS ==========
-        self.MOTOR_TYPE = "GM-25-370"
-        self.NO_LOAD_RPM = 300
-        self.GEAR_RATIO = 48
-        self.ENCODER_PPR = 11
-        self.EFFECTIVE_PPR = 528
-        
-        # ========== CONTROL VARIABLES ==========
-        self.speed = 0
-        self.target_speed = 50
-        self.direction = "stop"
-        self.is_running = False
-        
-        # ========== ENCODER VARIABLES ==========
-        self.encoder_count_a = 0
-        self.encoder_count_b = 0
-        self.encoder_a_direction = 1
-        self.encoder_b_direction = 1
-        
-        # ========== NAVIGATION VARIABLES ==========
-        self.target_yaw = 0
-        self.current_yaw = 0
-        self.yaw_error_threshold = 2.0  # degrees
-        self.distance_traveled = 0
-        
-        # ========== PID CONTROL ==========
-        self.kp = 0.8
-        self.ki = 0.01
-        self.kd = 0.05
-        self.prev_error = 0
-        self.integral = 0
-        
-        # ========== WHEEL SPECIFICATIONS ==========
-        self.wheel_diameter_cm = 6.5
-        self.wheel_circumference = math.pi * self.wheel_diameter_cm
-        self.wheelbase_cm = 15.0  # Distance between wheels
-        
-        # ========== INITIALIZE HARDWARE ==========
-        if GPIO_AVAILABLE:
-            self.setup_gpio()
-            self.setup_encoders()
-        
-        print(f"✅ Motor Controller with MPU-9250 initialized")
-        print(f"   MPU-9250 connected: {self.mpu.is_connected()}")
-    
-    def setup_gpio(self):
-        """
-        Configure GPIO pins for L298N motor driver
-        """
-        try:
-            # Motor control pins
-            motor_pins = [
-                self.MOTOR_A_PWM, self.MOTOR_A_IN1, self.MOTOR_A_IN2,
-                self.MOTOR_B_PWM, self.MOTOR_B_IN3, self.MOTOR_B_IN4
-            ]
-            
-            for pin in motor_pins:
-                GPIO.setup(pin, GPIO.OUT)
-                GPIO.output(pin, GPIO.LOW)
-            
-            # PWM initialization
-            self.pwm_a = GPIO.PWM(self.MOTOR_A_PWM, 1000)
-            self.pwm_b = GPIO.PWM(self.MOTOR_B_PWM, 1000)
-            self.pwm_a.start(0)
-            self.pwm_b.start(0)
-            
-            print("✅ Motor GPIO pins configured")
-            
-        except Exception as e:
-            print(f"❌ Motor GPIO setup error: {e}")
-    
-    def setup_encoders(self):
-        """
-        Configure GPIO pins for quadrature encoders
-        """
-        try:
-            encoder_pins = [
-                self.ENCODER_A_CHANNEL_A, self.ENCODER_A_CHANNEL_B,
-                self.ENCODER_B_CHANNEL_A, self.ENCODER_B_CHANNEL_B
-            ]
-            
-            for pin in encoder_pins:
-                GPIO.setup(pin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-            
-            # Encoder interrupts
-            GPIO.add_event_detect(self.ENCODER_A_CHANNEL_A, GPIO.RISING,
-                                callback=lambda x: self.encoder_a_callback())
-            GPIO.add_event_detect(self.ENCODER_B_CHANNEL_A, GPIO.RISING,
-                                callback=lambda x: self.encoder_b_callback())
-            
-            print("✅ Encoder GPIO pins configured")
-            
-        except Exception as e:
-            print(f"❌ Encoder GPIO setup error: {e}")
-    
-    def encoder_a_callback(self):
-        """Left encoder callback"""
-        self.encoder_count_a += 1
-    
-    def encoder_b_callback(self):
-        """Right encoder callback"""
-        self.encoder_count_b += 1
-    
-    def update_mpu(self):
-        """
-        Update MPU-9250 data for navigation
-        """
-        if self.mpu.is_connected():
-            self.mpu.read_sensors()
-            data = self.mpu.get_data()
-            self.current_yaw = data['yaw']
-            return data
-        return None
-    
-    def navigate_to_heading(self, target_heading):
-        """
-        Navigate to specific compass heading using MPU-9250
-        """
-        if not self.mpu.is_connected():
-            print("❌ MPU-9250 not connected for navigation")
-            return False
-        
-        print(f"🧭 Navigating to heading: {target_heading}°")
-        
-        # Update current heading
-        self.update_mpu()
-        
-        # Calculate shortest turn angle
-        angle_diff = target_heading - self.current_yaw
-        if angle_diff > 180:
-            angle_diff -= 360
-        elif angle_diff < -180:
-            angle_diff += 360
-        
-        # Turn in shortest direction
-        if abs(angle_diff) > self.yaw_error_threshold:
-            if angle_diff > 0:
-                self.turn_right(angle=abs(angle_diff))
-            else:
-                self.turn_left(angle=abs(angle_diff))
-        
-        print(f"✅ Reached target heading: {self.current_yaw:.1f}°")
-        return True
-    
-    def move_straight_distance(self, distance_cm, speed=None):
-        """
-        Move straight for specific distance using encoder feedback
-        """
-        if speed is None:
-            speed = self.target_speed
-        
-        print(f"📏 Moving straight: {distance_cm} cm at {speed}% speed")
-        
-        # Calculate required encoder counts
-        wheel_revs = distance_cm / self.wheel_circumference
-        required_counts = wheel_revs * self.EFFECTIVE_PPR
-        
-        # Reset encoders
-        start_count_a = self.encoder_count_a
-        start_count_b = self.encoder_count_b
-        
-        # Start moving
-        self.move_forward(speed)
-        
-        # Move until distance reached
-        try:
-            while True:
-                current_counts_a = self.encoder_count_a - start_count_a
-                current_counts_b = self.encoder_count_b - start_count_b
-                avg_counts = (current_counts_a + current_counts_b) / 2
-                
-                # Calculate progress
-                progress = avg_counts / required_counts
-                distance_done = progress * distance_cm
-                
-                # Update MPU for straight-line correction
-                if self.mpu.is_connected():
-                    self.update_mpu()
-                    
-                    # Simple straight-line correction based on yaw
-                    yaw_error = self.current_yaw - self.target_yaw
-                    if abs(yaw_error) > 1.0:
-                        # Adjust motor speeds to correct yaw
-                        correction = yaw_error * 0.5  # Correction factor
-                        left_speed = max(0, min(100, speed - correction))
-                        right_speed = max(0, min(100, speed + correction))
-                        self.set_motor_speed('A', left_speed, 'forward')
-                        self.set_motor_speed('B', right_speed, 'forward')
-                
-                if distance_done >= distance_cm:
-                    break
-                
-                time.sleep(0.01)
-                
-        except KeyboardInterrupt:
-            pass
-        
-        finally:
-            self.stop()
-        
-        actual_distance = distance_done
-        print(f"✅ Distance completed: {actual_distance:.1f} cm")
-        return actual_distance
-    
-    def set_motor_speed(self, motor, speed, direction):
-        """
-        Control motor speed and direction
-        """
-        if not GPIO_AVAILABLE:
-            return
-        
-        speed = max(0, min(speed, 100))
-        
-        if motor == 'A':  # Left motor
-            if direction == 'forward':
-                GPIO.output(self.MOTOR_A_IN1, GPIO.HIGH)
-                GPIO.output(self.MOTOR_A_IN2, GPIO.LOW)
-            elif direction == 'backward':
-                GPIO.output(self.MOTOR_A_IN1, GPIO.LOW)
-                GPIO.output(self.MOTOR_A_IN2, GPIO.HIGH)
-            else:  # stop
-                GPIO.output(self.MOTOR_A_IN1, GPIO.LOW)
-                GPIO.output(self.MOTOR_A_IN2, GPIO.LOW)
-            self.pwm_a.ChangeDutyCycle(speed)
-            
-        elif motor == 'B':  # Right motor
-            if direction == 'forward':
-                GPIO.output(self.MOTOR_B_IN3, GPIO.HIGH)
-                GPIO.output(self.MOTOR_B_IN4, GPIO.LOW)
-            elif direction == 'backward':
-                GPIO.output(self.MOTOR_B_IN3, GPIO.LOW)
-                GPIO.output(self.MOTOR_B_IN4, GPIO.HIGH)
-            else:  # stop
-                GPIO.output(self.MOTOR_B_IN3, GPIO.LOW)
-                GPIO.output(self.MOTOR_B_IN4, GPIO.LOW)
-            self.pwm_b.ChangeDutyCycle(speed)
+        pwm_pin.value = abs(speed) if direction != "stop" else 0
     
     def move_forward(self, speed=None):
-        """
-        Move robot forward with MPU-9250 heading maintenance
-        """
-        if speed is None:
-            speed = self.target_speed
-        
-        # Set target heading to current heading
-        if self.mpu.is_connected():
-            self.update_mpu()
-            self.target_yaw = self.current_yaw
-        
-        self.direction = "forward"
-        self.set_motor_speed('A', speed, 'forward')
-        self.set_motor_speed('B', speed, 'forward')
-        
-        print(f"🤖 Forward at {speed}%, Target yaw: {self.target_yaw:.1f}°")
+        speed = speed or self.default_speed
+        self._set_motor(self.left_motor_forward, self.left_motor_backward,
+                       self.left_motor_pwm, speed, "forward")
+        self._set_motor(self.right_motor_forward, self.right_motor_backward,
+                       self.right_motor_pwm, speed, "forward")
     
     def move_backward(self, speed=None):
-        if speed is None:
-            speed = self.target_speed
-        self.direction = "backward"
-        self.set_motor_speed('A', speed, 'backward')
-        self.set_motor_speed('B', speed, 'backward')
-        print(f"🤖 Backward at {speed}%")
+        speed = speed or self.default_speed
+        self._set_motor(self.left_motor_forward, self.left_motor_backward,
+                       self.left_motor_pwm, speed, "backward")
+        self._set_motor(self.right_motor_forward, self.right_motor_backward,
+                       self.right_motor_pwm, speed, "backward")
     
-    def turn_left(self, speed=None, angle=None):
-        """
-        Turn left with optional angle using MPU-9250
-        """
-        if speed is None:
-            speed = self.target_speed
-        
-        if angle and self.mpu.is_connected():
-            # Turn by specific angle
-            start_yaw = self.current_yaw
-            target_yaw = start_yaw - angle
-            
-            # Normalize target yaw
-            if target_yaw < 0:
-                target_yaw += 360
-            
-            print(f"🔄 Turning left {angle}°: {start_yaw:.1f}° → {target_yaw:.1f}°")
-            
-            # Start turning
-            self.set_motor_speed('A', speed, 'backward')
-            self.set_motor_speed('B', speed, 'forward')
-            
-            # Monitor angle until reached
-            while True:
-                self.update_mpu()
-                
-                # Calculate shortest angle difference
-                angle_diff = target_yaw - self.current_yaw
-                if angle_diff > 180:
-                    angle_diff -= 360
-                elif angle_diff < -180:
-                    angle_diff += 360
-                
-                if abs(angle_diff) < self.yaw_error_threshold:
-                    break
-                
-                time.sleep(0.01)
-            
-            self.stop()
-            print(f"✅ Turn complete: {self.current_yaw:.1f}°")
-            
+    def turn_left(self, speed=None):
+        speed = speed or self.turn_speed
+        self._set_motor(self.left_motor_forward, self.left_motor_backward,
+                       self.left_motor_pwm, speed, "backward")
+        self._set_motor(self.right_motor_forward, self.right_motor_backward,
+                       self.right_motor_pwm, speed, "forward")
+    
+    def turn_right(self, speed=None):
+        speed = speed or self.turn_speed
+        self._set_motor(self.left_motor_forward, self.left_motor_backward,
+                       self.left_motor_pwm, speed, "forward")
+        self._set_motor(self.right_motor_forward, self.right_motor_backward,
+                       self.right_motor_pwm, speed, "backward")
+    
+    def pivot_left(self, speed=None):
+        speed = speed or self.turn_speed
+        self._set_motor(self.left_motor_forward, self.left_motor_backward,
+                       self.left_motor_pwm, speed, "backward")
+        self._set_motor(self.right_motor_forward, self.right_motor_backward,
+                       self.right_motor_pwm, speed, "forward")
+    
+    def pivot_right(self, speed=None):
+        speed = speed or self.turn_speed
+        self._set_motor(self.left_motor_forward, self.left_motor_backward,
+                       self.left_motor_pwm, speed, "forward")
+        self._set_motor(self.right_motor_forward, self.right_motor_backward,
+                       self.right_motor_pwm, speed, "backward")
+    
+    def stop_all(self):
+        self._set_motor(self.left_motor_forward, self.left_motor_backward,
+                       self.left_motor_pwm, 0, "stop")
+        self._set_motor(self.right_motor_forward, self.right_motor_backward,
+                       self.right_motor_pwm, 0, "stop")
+    
+    def set_speeds(self, left_speed, right_speed):
+        if left_speed > 0:
+            self._set_motor(self.left_motor_forward, self.left_motor_backward,
+                          self.left_motor_pwm, left_speed, "forward")
+        elif left_speed < 0:
+            self._set_motor(self.left_motor_forward, self.left_motor_backward,
+                          self.left_motor_pwm, abs(left_speed), "backward")
         else:
-            # Simple turn without angle measurement
-            self.direction = "left"
-            self.set_motor_speed('A', speed, 'backward')
-            self.set_motor_speed('B', speed, 'forward')
-            print(f"🤖 Turning left at {speed}%")
-    
-    def turn_right(self, speed=None, angle=None):
-        """
-        Turn right with optional angle using MPU-9250
-        """
-        if speed is None:
-            speed = self.target_speed
+            self._set_motor(self.left_motor_forward, self.left_motor_backward,
+                          self.left_motor_pwm, 0, "stop")
         
-        if angle and self.mpu.is_connected():
-            # Turn by specific angle
-            start_yaw = self.current_yaw
-            target_yaw = start_yaw + angle
-            
-            # Normalize target yaw
-            if target_yaw >= 360:
-                target_yaw -= 360
-            
-            print(f"🔄 Turning right {angle}°: {start_yaw:.1f}° → {target_yaw:.1f}°")
-            
-            # Start turning
-            self.set_motor_speed('A', speed, 'forward')
-            self.set_motor_speed('B', speed, 'backward')
-            
-            # Monitor angle until reached
-            while True:
-                self.update_mpu()
-                
-                # Calculate shortest angle difference
-                angle_diff = target_yaw - self.current_yaw
-                if angle_diff > 180:
-                    angle_diff -= 360
-                elif angle_diff < -180:
-                    angle_diff += 360
-                
-                if abs(angle_diff) < self.yaw_error_threshold:
-                    break
-                
-                time.sleep(0.01)
-            
-            self.stop()
-            print(f"✅ Turn complete: {self.current_yaw:.1f}°")
-            
+        if right_speed > 0:
+            self._set_motor(self.right_motor_forward, self.right_motor_backward,
+                          self.right_motor_pwm, right_speed, "forward")
+        elif right_speed < 0:
+            self._set_motor(self.right_motor_forward, self.right_motor_backward,
+                          self.right_motor_pwm, abs(right_speed), "backward")
         else:
-            # Simple turn without angle measurement
-            self.direction = "right"
-            self.set_motor_speed('A', speed, 'forward')
-            self.set_motor_speed('B', speed, 'backward')
-            print(f"🤖 Turning right at {speed}%")
+            self._set_motor(self.right_motor_forward, self.right_motor_backward,
+                          self.right_motor_pwm, 0, "stop")
     
-    def stop(self):
-        """Stop all motors"""
-        self.direction = "stop"
-        self.set_motor_speed('A', 0, 'stop')
-        self.set_motor_speed('B', 0, 'stop')
-        print("🤖 Stopped")
-    
-    def set_speed(self, speed):
-        """Set target speed"""
-        self.target_speed = max(30, min(speed, 100))
-        print(f"⚙️ Target speed: {self.target_speed}%")
-    
-    def get_sensor_data(self):
-        """Get all sensor data"""
-        mpu_data = self.update_mpu()
-        
-        return {
-            'encoders': {
-                'left': self.encoder_count_a,
-                'right': self.encoder_count_b
-            },
-            'speed': self.target_speed,
-            'direction': self.direction,
-            'mpu': mpu_data,
-            'yaw': self.current_yaw if mpu_data else 0,
-            'distance_traveled': self.distance_traveled
-        }
-    
-    def calibrate_mpu(self):
-        """Calibrate MPU-9250"""
-        if self.mpu.is_connected():
-            print("Starting MPU-9250 calibration...")
-            self.mpu.calibrate()
+    def cleanup(self):
+        self.stop_all()
+        self.left_motor_pwm.close()
+        self.left_motor_forward.close()
+        self.left_motor_backward.close()
+        self.right_motor_pwm.close()
+        self.right_motor_forward.close()
+        self.right_motor_backward.close()
+
+class MotorBridge:
+    def __init__(self, port, baudrate=115200, timeout=0.2):
+        self.port = port
+        self.baudrate = baudrate
+        self.timeout = timeout
+        self.serial = serial.Serial(port=port, baudrate=baudrate, timeout=timeout)
+
+    def send_command(self, payload):
+        if not self.serial or not self.serial.is_open:
+            return False
+        try:
+            data = json.dumps(payload).encode("utf-8") + b"\n"
+            self.serial.write(data)
             return True
-        return False
-    
-    def set_yaw_reference(self):
-        """Set current yaw as reference (0°)"""
-        if self.mpu.is_connected():
-            self.mpu.set_yaw_re
+        except Exception as exc:
+            return False
+
+    def close(self):
+        try:
+            if self.serial and self.serial.is_open:
+                self.serial.close()
+        except Exception:
+            pass
+
+class VisionHMI:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Robot de Surveillance-HMI")
+        self.root.geometry("1280x720")
+        self.root.minsize(1024, 600)
+        self.root.configure(bg="#e6e6e6")
+        self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
+
+        self.cap = None
+        self.picam2 = None
+        self.use_static_image = False
+        self.static_image = None
+        self.camera_type = None
+        self.init_camera()
+
+        self.mode = tk.StringVar(value="Mode Réglage")
+        self.mode.trace("w", self.update_mode)
+
+        self.rois = []
+        self.selected_roi = None
+        self.drawing = False
+        self.resizing = False
+        self.moving = False
+        self.rotating = False
+        self.drawing_mask = False
+        self.ix, self.iy = -1, -1
+        self.roi_id = 0
+        self.hovered_roi = None
+        self.snap_to_grid = tk.BooleanVar(value=False)
+        self.roi_shape = tk.StringVar(value="rectangle")
+
+        self.params = {
+            "gpio_trigger_pin": tk.IntVar(value=-1),
+            "yolo_confidence": tk.DoubleVar(value=0.5),
+            "face_scale_factor": tk.DoubleVar(value=1.1),
+            "face_min_neighbors": tk.IntVar(value=5),
+        }
+
+        self.surveillance_features = {
+            "YOLO Person Detection": tk.BooleanVar(value=True),
+            "Face Detection": tk.BooleanVar(value=False),
+            "Motion Detection": tk.BooleanVar(value=False),
+        }
+
+        self.cycle_state = "Idle"
+        self.cycle_results = {}
+
+        self.gpio_trigger_active = False
+        self.gpio_thread = None
+
+        self.log_file = "inspection_log.csv"
+        self.init_log()
+
+        self.yolo_enabled = tk.BooleanVar(value=False)
+        self.yolo_model = None
+        self.face_enabled = tk.BooleanVar(value=False)
+        self.face_cascade = None
+        
+        self.surveillance_mode = tk.BooleanVar(value=False)
+        self.motion_detection = tk.BooleanVar(value=False)
+        self.alert_threshold = tk.DoubleVar(value=0.5)
+        self.last_detection_time = None
+        self.detection_count = 0
+        self.current_detections = 0
+        self.behavior_flags = {
+            "detect_all_objects": tk.BooleanVar(value=True),
+            "smart_obstacle_mode": tk.BooleanVar(value=True),
+        }
+        self.detect_all_objects = self.behavior_flags["detect_all_objects"]
+        self.smart_obstacle_mode = self.behavior_flags["smart_obstacle_mode"]
+        self.current_detection_summary = {"human": 0, "obstacle": 0}
+        self.human_class_ids = {0}
+        self.serial_port = "COM3" if sys.platform.startswith("win") else "/dev/ttyUSB0"
+        self.motor_bridge = None
+        self.last_turn_direction = "left"
+        self.buzzer_enabled = tk.BooleanVar(value=True)
+        self.human_avoidance_stop_duration = 3.0
+        self.human_avoidance_turn_duration = 1200
+        self.is_avoiding_human = False
+
+        self.motor_controller = None
+        self.navigation_mode = tk.StringVar(value="auto")
+        self.current_speed = tk.DoubleVar(value=0.6)
+
+        self.gpio_simulation = not GPIO_AVAILABLE
+        
+        if GPIO_AVAILABLE:
+            self.setup_real_gpio()
+        
+        self.init_motor_controller()
+        self.setup_gui()
+        self.load_settings()
+        self.update_video()
+        self.start_gpio_simulation()
+
+        self.last_live_blob_results = None
+        self.motor_bridge = self.init_motor_bridge()
+
+    def init_motor_controller(self):
+        try:
+            self.motor_controller = DualMotorController()
+            self.show_toast("Contrôleur moteur initialisé", 2000)
+        except Exception as e:
+            self.show_toast(f"Erreur contrôleur moteur: {e}", 3000)
+            self.motor_controller = None
+
+    def init_camera(self):
+        if PICAMERA2_AVAILABLE:
+            try:
+                self.picam2 = Picamera2()
+                preview_config = self.picam2.create_preview_configuration(
+                    main={"size": (640, 480), "format": "RGB888"},
+                    controls={"FrameRate": 30}
+                )
+                self.picam2.configure(preview_config)
+                self.picam2.start()
+                time.sleep(0.5)
+                test_frame = self.picam2.capture_array()
+                if test_frame is not None:
+                    self.camera_type = "picamera2"
+                    return
+                else:
+                    self.picam2.stop()
+                    self.picam2.close()
+                    self.picam2 = None
+            except Exception as e:
+                if self.picam2:
+                    try:
+                        self.picam2.close()
+                    except:
+                        pass
+                    self.picam2 = None
+
+    def ensure_yolo_loaded(self):
+        try:
+            if self.yolo_model is None:
+                from ultralytics import YOLO
+                self.yolo_model = YOLO("yolov8n.pt")
+                self.yolo_model.overrides['imgsz'] = 320
+                self.yolo_model.overrides['device'] = 'cpu'
+                self.yolo_model.overrides['half'] = False
+                self.yolo_model.overrides['verbose'] = False
+        except Exception as e:
+            messagebox.showerror("YOLO", f"Erreur de chargement modèle: {e}")
+            self.yolo_enabled.set(False)
+
+    def ensure_haar_loaded(self):
+        try:
+            if self.face_cascade is None:
+                haar_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+                self.face_cascade = cv2.CascadeClassifier(haar_path)
+                if self.face_cascade.empty():
+                    raise Exception("Haar model not found")
+        except Exception as e:
+            messagebox.showerror("Face", f"Erreur de chargement Haar: {e}")
+            self.face_enabled.set(False)
+
+    def setup_real_gpio(self):
+        try:
+            GPIO.setmode(GPIO.BCM)
+            GPIO.setwarnings(False)
+            self.led_pins = {
+                'ok': 18,
+                'ng': 19,
+                'alert': 20
+            }
+            self.buzzer_pin = 21
+
+            for pin in self.led_pins.values():
+                GPIO.setup(pin, GPIO.OUT)
+                GPIO.output(pin, GPIO.LOW)
+            GPIO.setup(self.buzzer_pin, GPIO.OUT)
+            GPIO.output(self.buzzer_pin, GPIO.LOW)
+            self.show_toast("GPIO réel configuré pour Raspberry Pi")
+        except Exception as e:
+            self.show_toast(f"Erreur GPIO: {e}")
+
+    def handle_surveillance_alert(self, confidence):
+        current_time = time.time()
+        
+        if self.last_detection_time and (current_time - self.last_detection_time) < 5:
+            return
+            
+        if self.is_avoiding_human:
+            return
+            
+        self.last_detection_time = current_time
+        self.detection_count += 1
+        self.is_avoiding_human = True
+        
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        alert_msg = f"SURVEILLANCE ALERT #{self.detection_count} - Person detected (conf: {confidence:.2f})"
+        
+        try:
+            with open(self.log_file, "a", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow([timestamp, "SURVEILLANCE", "Person Detection", "ALERT", f"Confidence: {confidence:.2f}"])
+        except Exception as e:
+            print(f"Erreur log: {e}")
+        
+        self.show_toast(alert_msg, 5000)
+        
+        if GPIO_AVAILABLE and hasattr(self, 'led_pins'):
+            try:
+                GPIO.output(self.led_pins['alert'], GPIO.HIGH)
+                self.root.after(2000, lambda: GPIO.output(self.led_pins['alert'], GPIO.LOW))
+            except Exception as e:
+                print(f"Erreur LED: {e}")
+        
+        self.play_buzzer_pattern("human")
+        self.avoid_human(confidence)
+
+    def init_motor_bridge(self):
+        if not SERIAL_AVAILABLE:
+            self.show_toast("pyserial indisponible - commandes moteur désactivées")
+            return None
+
+        try:
+            bridge = MotorBridge(self.serial_port)
+            self.show_toast(f"Pont moteur connecté ({self.serial_port})")
+            return bridge
+        except Exception as exc:
+            self.show_toast(f"Pont moteur indisponible: {exc}")
+            return None
+
+    def play_buzzer_pattern(self, pattern: str = "obstacle"):
+        if not GPIO_AVAILABLE or not hasattr(self, "buzzer_pin"):
+            return
+        if hasattr(self, "buzzer_enabled") and not self.buzzer_enabled.get():
+            return
+
+        def beep(duration_ms):
+            try:
+                GPIO.output(self.buzzer_pin, GPIO.HIGH)
+                time.sleep(duration_ms / 1000.0)
+                GPIO.output(self.buzzer_pin, GPIO.LOW)
+            except Exception:
+                pass
+
+        if pattern == "human":
+            threading.Thread(target=beep, args=(400,), daemon=True).start()
+        else:
+            def double_beep():
+                beep(150)
+                time.sleep(0.1)
+                beep(150)
+            threading.Thread(target=double_beep, daemon=True).start()
+
+    def send_drive_command(self, action, **kwargs):
+        if not self.motor_bridge:
+            return False
+        payload = {"action": action, **kwargs}
+        success = self.motor_bridge.send_command(payload)
+        if not success:
+            self.show_toast("Commande moteur échouée")
+        return success
+
+    def stop_robot(self, reason="safety"):
+        if self.motor_controller:
+            self.motor_controller.stop_all()
+        if self.send_drive_command("stop", reason=reason):
+            self.status_var.set(f"Arrêt d'urgence ({reason})")
+
+    def resume_navigation(self):
+        if self.motor_controller and self.navigation_mode.get() == "auto":
+            self.motor_controller.move_forward(self.current_speed.get())
+        if self.send_drive_command("resume"):
+            self.status_var.set("Navigation nominale")
+
+    def avoid_human(self, confidence):
+        self.stop_robot(reason="human_detected")
+        self.status_var.set(f"⚠️ Humain détecté - Arrêt et calcul navigation...")
+        
+        stop_duration_ms = int(self.human_avoidance_stop_duration * 1000)
+        
+        def calculate_and_avoid():
+            turn_direction = self.last_turn_direction
+            self.last_turn_direction = "right" if turn_direction == "left" else "left"
+            
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            try:
+                with open(self.log_file, "a", newline="") as f:
+                    writer = csv.writer(f)
+                    writer.writerow([timestamp, "NAVIGATION", "Human Avoidance", "CALC", f"Direction: {turn_direction}"])
+            except Exception as e:
+                print(f"Erreur log navigation: {e}")
+            
+            self.status_var.set(f"🗺️ Calcul terminé → Virage {turn_direction} pour éviter l'humain")
+            
+            if self.send_drive_command(
+                "avoid",
+                label="human",
+                turn=turn_direction,
+                duration=self.human_avoidance_turn_duration,
+            ):
+                self.show_toast(f"Changement de direction: {turn_direction}", 2000)
+                
+                def resume_after_turn():
+                    self.resume_navigation()
+                    self.is_avoiding_human = False
+                    self.status_var.set("✅ Navigation reprise - Trajectoire mise à jour")
+                
+                self.root.after(self.human_avoidance_turn_duration + 500, resume_after_turn)
+            else:
+                self.root.after(2000, lambda: setattr(self, 'is_avoiding_human', False))
+        
+        self.root.after(stop_duration_ms, calculate_and_avoid)
+
+    def avoid_obstacle(self, label, duration_ms=800):
+        turn_direction = self.last_turn_direction
+        self.last_turn_direction = "right" if turn_direction == "left" else "left"
+        if self.send_drive_command(
+            "avoid",
+            label=label,
+            turn=turn_direction,
+            duration=duration_ms,
+        ):
+            self.status_var.set(f"Avoid {label} → {turn_direction}")
+            self.root.after(duration_ms + 500, self.resume_navigation)
+
+    def handle_obstacle_detection(self, label, confidence):
+        if not self.smart_obstacle_mode.get():
+            return
+
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        detail = f"Obstacle {label} (conf: {confidence:.2f})"
+
+        try:
+            with open(self.log_file, "a", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow([timestamp, "SMART_ROUTING", "Obstacle", "INFO", detail])
+        except Exception as e:
+            print(f"Erreur log obstacle: {e}")
+
+        self.show_toast(f"⚠️ Obstacle détecté: {label}", 2500)
+        self.status_var.set(f"Obstacle détecté → recalcul trajectoire ({label})")
+        self.play_buzzer_pattern("obstacle")
+        
+        if self.motor_controller:
+            if self.navigation_mode.get() == "auto":
+                self.avoid_obstacle_motor(label)
+
+    def avoid_obstacle_motor(self, label):
+        turn_direction = self.last_turn_direction
+        self.last_turn_direction = "right" if turn_direction == "left" else "left"
+        
+        def obstacle_avoidance():
+            if turn_direction == "left":
+                self.motor_controller.pivot_left(0.4)
+            else:
+                self.motor_controller.pivot_right(0.4)
+                
+            time.sleep(0.8)
+            if self.navigation_mode.get() == "auto":
+                self.motor_controller.move_forward(self.current_speed.get())
+            
+            self.root.after(0, lambda: self.status_var.set(f"Obstacle évité → {turn_direction}"))
+        
+        threading.Thread(target=obstacle_avoidance, daemon=True).start()
+
+    def toggle_surveillance_mode(self):
+        if self.surveillance_mode.get():
+            if not self.yolo_enabled.get():
+                self.show_toast("⚠️ Activez 'YOLO Person' d'abord pour la surveillance", 3000)
+                self.surveillance_mode.set(False)
+                return
+            
+            self.show_toast("🔍 Mode Surveillance ACTIVÉ", 3000)
+            self.detection_count = 0
+            self.current_detections = 0
+            self.surveillance_status_var.set("🔍 SURVEILLANCE ACTIVE")
+            self.surveillance_status_label.config(text="Surveillance: ACTIVE", foreground="green")
+            self.current_detection_summary = {"human": 0, "obstacle": 0}
+            self.detection_count_label.config(text="Current: H=0 | O=0 | Total Alerts: 0")
+            
+            if not self.yolo_enabled.get():
+                self.yolo_enabled.set(True)
+                self.show_toast("YOLO Person activé automatiquement")
+        else:
+            self.show_toast("🔍 Mode Surveillance DÉSACTIVÉ", 2000)
+            self.surveillance_status_var.set("")
+            self.surveillance_status_label.config(text="Surveillance: INACTIVE", foreground="red")
+
+    def start_auto_navigation(self):
+        if not self.motor_controller:
+            return
+            
+        self.navigation_mode.set("auto")
+        self.motor_controller.move_forward(self.current_speed.get())
+        self.status_var.set("Navigation autonome activée")
+
+    def stop_auto_navigation(self):
+        self.navigation_mode.set("stopped")
+        self.stop_robot("manual_stop")
+        self.status_var.set("Navigation arrêtée")
+
+    def manual_control(self, command):
+        if not self.motor_controller:
+            return
+            
+        commands = {
+            "forward": lambda: self.motor_controller.move_forward(self.current_speed.get()),
+            "backward": lambda: self.motor_controller.move_backward(self.current_speed.get()),
+            "left": lambda: self.motor_controller.turn_left(self.current_speed.get() * 0.7),
+            "right": lambda: self.motor_controller.turn_right(self.current_speed.get() * 0.7),
+            "stop": lambda: self.motor_controller.stop_all(),
+            "pivot_left": lambda: self.motor_controller.pivot_left(0.5),
+            "pivot_right": lambda: self.motor_controller.pivot_right(0.5),
+        }
+        
+        if command in commands:
+            commands[command]()
+            self.status_var.set(f"Commande manuelle: {command}")
+
+    def setup_gui(self):
+        self.menubar = tk.Menu(self.root, bg="#f5f5f5", fg="#212121")
+        self.root.config(menu=self.menubar)
+        
+        file_menu = tk.Menu(self.menubar, tearoff=0, bg="#f5f5f5", fg="#212121")
+        file_menu.add_command(label="Load Image", command=self.load_image)
+        file_menu.add_command(label="Save Image", command=self.save_image)
+        file_menu.add_separator()
+        file_menu.add_command(label="Exit", command=self.on_closing)
+        self.menubar.add_cascade(label="File", menu=file_menu)
+
+        self.main_frame = ttk.Frame(self.root, padding=10)
+        self.main_frame.pack(fill=tk.BOTH, expand=True)
+
+        self.status_frame = ttk.Frame(self.main_frame, relief=tk.SUNKEN, borderwidth=1)
+        self.status_frame.pack(side=tk.BOTTOM, fill=tk.X)
+        self.status_var = tk.StringVar(value="Ready | Mode Réglage")
+        ttk.Label(self.status_frame, textvariable=self.status_var).pack(side=tk.LEFT, padx=5)
+        self.time_var = tk.StringVar()
+        ttk.Label(self.status_frame, textvariable=self.time_var).pack(side=tk.RIGHT, padx=5)
+        
+        self.mode_selector = ttk.Combobox(self.status_frame, textvariable=self.mode, values=["Mode Réglage", "Run Mode"], state="readonly", width=15)
+        self.mode_selector.pack(side=tk.RIGHT, padx=5)
+        
+        ttk.Checkbutton(self.status_frame, text="YOLO Person", variable=self.yolo_enabled).pack(side=tk.RIGHT, padx=5)
+        ttk.Checkbutton(self.status_frame, text="Face (Haar)", variable=self.face_enabled).pack(side=tk.RIGHT, padx=5)
+        ttk.Checkbutton(self.status_frame, text="All Objects", variable=self.detect_all_objects).pack(side=tk.RIGHT, padx=5)
+        ttk.Checkbutton(self.status_frame, text="Smart Obstacle", variable=self.smart_obstacle_mode).pack(side=tk.RIGHT, padx=5)
+        ttk.Checkbutton(self.status_frame, text="🔊 Buzzer", variable=self.buzzer_enabled).pack(side=tk.RIGHT, padx=5)
+        
+        surveillance_cb = ttk.Checkbutton(self.status_frame, text="🔍 Surveillance", variable=self.surveillance_mode, command=self.toggle_surveillance_mode)
+        surveillance_cb.pack(side=tk.RIGHT, padx=5)
+        
+        self.surveillance_status_var = tk.StringVar(value="")
+        ttk.Label(self.status_frame, textvariable=self.surveillance_status_var, foreground="#ff6b35", font=("Segoe UI", 9, "bold")).pack(side=tk.RIGHT, padx=5)
+        
+        self.update_time()
+
+        self.paned_window = ttk.PanedWindow(self.main_frame, orient=tk.HORIZONTAL)
+        self.paned_window.pack(fill=tk.BOTH, expand=True)
+
+        self.left_panel = ttk.Frame(self.paned_window)
+        self.paned_window.add(self.left_panel, weight=1)
+
+        self.canvas = tk.Canvas(self.left_panel, width=640, height=480, bg="#000000", highlightthickness=1, highlightbackground="#d4d4d4")
+        self.canvas.pack(padx=5, pady=5)
+
+        self.right_panel = ttk.Frame(self.paned_window)
+        self.paned_window.add(self.right_panel, weight=1)
+
+        self.notebook = ttk.Notebook(self.right_panel)
+        self.notebook.pack(fill=tk.BOTH, expand=True)
+
+        self.inspection_frame = ttk.Frame(self.notebook)
+        self.notebook.add(self.inspection_frame, text="🔍 Surveillance")
+        
+        ttk.Label(self.inspection_frame, text="Surveillance Settings", font=("Segoe UI", 12, "bold")).pack(pady=10)
+        
+        yolo_frame = ttk.LabelFrame(self.inspection_frame, text="YOLO Person Detection", padding=10)
+        yolo_frame.pack(fill=tk.X, padx=10, pady=5)
+        ttk.Label(yolo_frame, text="Confidence Threshold:").pack(side=tk.LEFT)
+        ttk.Scale(yolo_frame, from_=0.1, to=1.0, orient=tk.HORIZONTAL, variable=self.params["yolo_confidence"], length=150).pack(side=tk.LEFT, padx=5)
+        ttk.Label(yolo_frame, textvariable=self.params["yolo_confidence"]).pack(side=tk.LEFT, padx=5)
+        
+        face_frame = ttk.LabelFrame(self.inspection_frame, text="Face Detection (Haar)", padding=10)
+        face_frame.pack(fill=tk.X, padx=10, pady=5)
+        ttk.Label(face_frame, text="Scale Factor:").pack(side=tk.LEFT)
+        ttk.Scale(face_frame, from_=1.05, to=1.5, orient=tk.HORIZONTAL, variable=self.params["face_scale_factor"], length=100).pack(side=tk.LEFT, padx=5)
+        ttk.Label(face_frame, textvariable=self.params["face_scale_factor"]).pack(side=tk.LEFT, padx=5)
+        ttk.Label(face_frame, text="Min Neighbors:").pack(side=tk.LEFT, padx=(20,0))
+        ttk.Scale(face_frame, from_=3, to=10, orient=tk.HORIZONTAL, variable=self.params["face_min_neighbors"], length=100).pack(side=tk.LEFT, padx=5)
+        min_neighbors_label = ttk.Label(face_frame, text="5")
+        min_neighbors_label.pack(side=tk.LEFT, padx=5)
+        
+        def update_min_neighbors_label(*args):
+            min_neighbors_label.config(text=str(int(self.params["face_min_neighbors"].get())))
+        
+        self.params["face_min_neighbors"].trace("w", update_min_neighbors_label)
+        
+        human_avoid_frame = ttk.LabelFrame(self.inspection_frame, text="Human Avoidance", padding=10)
+        human_avoid_frame.pack(fill=tk.X, padx=10, pady=5)
+        ttk.Label(human_avoid_frame, text="Stop Duration (s):").pack(side=tk.LEFT)
+        self.human_stop_duration_var = tk.DoubleVar(value=self.human_avoidance_stop_duration)
+        ttk.Scale(human_avoid_frame, from_=1.0, to=10.0, orient=tk.HORIZONTAL, variable=self.human_stop_duration_var, length=150).pack(side=tk.LEFT, padx=5)
+        ttk.Label(human_avoid_frame, textvariable=self.human_stop_duration_var).pack(side=tk.LEFT, padx=5)
+        
+        def update_stop_duration(*args):
+            self.human_avoidance_stop_duration = self.human_stop_duration_var.get()
+        
+        self.human_stop_duration_var.trace("w", update_stop_duration)
+        
+        status_frame = ttk.LabelFrame(self.inspection_frame, text="Status", padding=10)
+        status_frame.pack(fill=tk.X, padx=10, pady=5)
+        self.surveillance_status_label = ttk.Label(status_frame, text="Surveillance: INACTIVE", foreground="red")
+        self.surveillance_status_label.pack()
+        self.detection_count_label = ttk.Label(status_frame, text="Current: H=0 | O=0 | Total Alerts: 0")
+        self.detection_count_label.pack()
+
+        self.control_frame = ttk.Frame(self.notebook)
+        self.notebook.add(self.control_frame, text="🚗 Contrôle")
+        
+        control_inner = ttk.Frame(self.control_frame)
+        control_inner.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        
+        ttk.Label(control_inner, text="Contrôle du Robot", font=("Segoe UI", 14, "bold")).pack(pady=10)
+        
+        mode_frame = ttk.Frame(control_inner)
+        mode_frame.pack(pady=10)
+        
+        ttk.Radiobutton(mode_frame, text="Autonome", variable=self.navigation_mode, 
+                       value="auto", command=self.start_auto_navigation).pack(side=tk.LEFT, padx=5)
+        ttk.Radiobutton(mode_frame, text="Manuel", variable=self.navigation_mode, 
+                       value="manual").pack(side=tk.LEFT, padx=5)
+        ttk.Radiobutton(mode_frame, text="Arrêt", variable=self.navigation_mode,
+                       value="stopped", command=self.stop_auto_navigation).pack(side=tk.LEFT, padx=5)
+        
+        speed_frame = ttk.LabelFrame(control_inner, text="Vitesse", padding=10)
+        speed_frame.pack(fill=tk.X, pady=10)
+        
+        ttk.Label(speed_frame, text="Vitesse:").pack(side=tk.LEFT)
+        ttk.Scale(speed_frame, from_=0.1, to=1.0, orient=tk.HORIZONTAL,
+                  variable=self.current_speed, length=200).pack(side=tk.LEFT, padx=10)
+        ttk.Label(speed_frame, textvariable=self.current_speed).pack(side=tk.LEFT)
+        
+        button_frame = ttk.Frame(control_inner)
+        button_frame.pack(pady=20)
+        
+        row1 = ttk.Frame(button_frame)
+        row1.pack(pady=5)
+        ttk.Button(row1, text="▲ Avancer", width=15,
+                   command=lambda: self.manual_control("forward")).pack(side=tk.LEFT, padx=5)
+        
+        row2 = ttk.Frame(button_frame)
+        row2.pack(pady=5)
+        ttk.Button(row2, text="◀ Tourner G", width=15,
+                   command=lambda: self.manual_control("left")).pack(side=tk.LEFT, padx=5)
+        ttk.Button(row2, text="■ Arrêter", width=15,
+                   command=lambda: self.manual_control("stop")).pack(side=tk.LEFT, padx=5)
+        ttk.Button(row2, text="Tourner D ▶", width=15,
+                   command=lambda: self.manual_control("right")).pack(side=tk.LEFT, padx=5)
+        
+        row3 = ttk.Frame(button_frame)
+        row3.pack(pady=5)
+        ttk.Button(row3, text="▼ Reculer", width=15,
+                   command=lambda: self.manual_control("backward")).pack(side=tk.LEFT, padx=5)
+        
+        pivot_frame = ttk.Frame(control_inner)
+        pivot_frame.pack(pady=10)
+        
+        ttk.Button(pivot_frame, text="⮜ Pivoter G", 
+                   command=lambda: self.manual_control("pivot_left")).pack(side=tk.LEFT)
